@@ -497,7 +497,12 @@ fn amounts(ui: &mut egui::Ui, m: &Meter, size: f32) {
     });
 }
 
-fn provider_block(ui: &mut egui::Ui, p: Provider, slot: &Slot) {
+fn provider_block(
+    ui: &mut egui::Ui,
+    p: Provider,
+    slot: &Slot,
+    logos: &HashMap<Provider, egui::TextureHandle>,
+) {
     let single = slot
         .meters
         .as_ref()
@@ -505,6 +510,7 @@ fn provider_block(ui: &mut egui::Ui, p: Provider, slot: &Slot) {
         .map(|m| &m[0]);
 
     ui.horizontal(|ui| {
+        provider_logo(ui, p, logos);
         let name = RichText::new(p.name()).size(13.0).strong().color(TEXT);
         ui.label(name);
         if slot.loading {
@@ -796,6 +802,12 @@ fn logo_color(p: Provider) -> Color32 {
     }
 }
 
+fn provider_logo(ui: &mut egui::Ui, p: Provider, logos: &HashMap<Provider, egui::TextureHandle>) {
+    if let Some(logo) = logos.get(&p) {
+        ui.add(egui::Image::new((logo.id(), Vec2::splat(13.0))).tint(logo_color(p)));
+    }
+}
+
 /// The minimized view: "<logo> COP 42%  <logo> CLD 17%  <logo> CDX 99%" on one line.
 fn compact_row(
     ui: &mut egui::Ui,
@@ -808,9 +820,7 @@ fn compact_row(
             ui.add_space(8.0);
         }
         let slot = slots.get(p).cloned().unwrap_or_default();
-        if let Some(logo) = logos.get(p) {
-            ui.add(egui::Image::new((logo.id(), Vec2::splat(13.0))).tint(logo_color(*p)));
-        }
+        provider_logo(ui, *p, logos);
         ui.label(RichText::new(p.short_name()).size(11.5).color(MUTED));
         // The most-used meter is the one that matters when space is this tight.
         let pct = slot
@@ -937,7 +947,7 @@ impl eframe::App for App {
                             ui.add_space(5.0);
                         }
                         let slot = self.slots.get(p).cloned().unwrap_or_default();
-                        provider_block(ui, *p, &slot);
+                        provider_block(ui, *p, &slot, &self.logos);
                     }
 
                     ui.add_space(4.0);
