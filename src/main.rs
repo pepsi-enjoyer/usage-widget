@@ -339,13 +339,17 @@ fn settle_window(frame: &eframe::Frame) -> bool {
 
 /// The taskbar is topmost too, and whenever it is activated Windows raises it
 /// above every other topmost window, hiding the widget if it sits on the taskbar.
-/// Listens for foreground changes and puts the widget back on top whenever the
-/// taskbar comes forward. Only the first call installs the hook.
+/// The taskbar also raises itself in other ways (the Start menu opening or
+/// closing, for one), so rather than chasing each cause this checks every
+/// `CHECK_MS` whether any taskbar is above the widget and, if so, raises the
+/// widget again. A foreground hook does the same immediately for taskbar clicks.
+/// Only the first call installs the timer and hook.
 #[cfg(windows)]
 fn watch_taskbar(hwnd: isize) {
     use std::sync::atomic::{AtomicIsize, Ordering};
 
     type WinEventProc = unsafe extern "system" fn(isize, u32, isize, i32, i32, u32, u32);
+    type TimerProc = unsafe extern "system" fn(isize, u32, usize, u32);
     #[link(name = "user32")]
     unsafe extern "system" {
         fn SetWinEventHook(
@@ -358,11 +362,59 @@ fn watch_taskbar(hwnd: isize) {
             flags: u32,
         ) -> isize;
         fn GetClassNameW(hwnd: isize, name: *mut u16, len: i32) -> i32;
+        fn SetTimer(hwnd: isize, id: usize, ms: u32, proc: TimerProc) -> usize;
+        fn GetWindow(hwnd: isize, cmd: u32) -> isize;
     }
     const EVENT_SYSTEM_FOREGROUND: u32 = 0x3;
     const WINEVENT_OUTOFCONTEXT: u32 = 0x0;
+    const GW_HWNDPREV: u32 = 3;
+    /// How often to check that no taskbar has been raised above the widget.
+    const CHECK_MS: u32 = 500;
 
     static WIDGET: AtomicIsize = AtomicIsize::new(0);
+
+    fn is_taskbar(hwnd: isize) -> bool {
+        let mut buf = [0u16; 32];
+        let len = unsafe { GetClassNameW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
+        let class = String::from_utf16_lossy(&buf[..len.max(0) as usize]);
+        // The primary monitor's taskbar, and the ones on other monitors.
+        class == "Shell_TrayWnd" || class == "Shell_SecondaryTrayWnd"
+    }
+
+    /// True if a taskbar is above the widget in the z-order. Only the few
+    /// windows above it are walked, since it sits near the top.
+    fn taskbar_above() -> bool {
+        let mut h = WIDGET.load(Ordering::Relaxed);
+        loop {
+            h = unsafe { GetWindow(h, GW_HWNDPREV) };
+            if h == 0 {
+                return false;
+            }
+            if is_taskbar(h) {
+                return true;
+            }
+        }
+    }
+
+    fn raise() {
+        unsafe {
+            SetWindowPos(
+                WIDGET.load(Ordering::Relaxed),
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+    }
+
+    unsafe extern "system" fn on_timer(_hwnd: isize, _msg: u32, _id: usize, _time: u32) {
+        if taskbar_above() {
+            raise();
+        }
+    }
 
     unsafe extern "system" fn on_foreground(
         _hook: isize,
@@ -373,30 +425,20 @@ fn watch_taskbar(hwnd: isize) {
         _thread: u32,
         _time: u32,
     ) {
-        let mut buf = [0u16; 32];
-        let len = unsafe { GetClassNameW(foreground, buf.as_mut_ptr(), buf.len() as i32) };
-        let class = String::from_utf16_lossy(&buf[..len.max(0) as usize]);
-        // The primary monitor's taskbar, and the ones on other monitors.
-        if class == "Shell_TrayWnd" || class == "Shell_SecondaryTrayWnd" {
-            unsafe {
-                SetWindowPos(
-                    WIDGET.load(Ordering::Relaxed),
-                    HWND_TOPMOST,
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                );
-            }
+        if is_taskbar(foreground) {
+            raise();
         }
     }
 
     if WIDGET.swap(hwnd, Ordering::Relaxed) != 0 {
         return;
     }
-    // Out-of-context hooks are delivered through this (the UI) thread's message loop.
+    // Out-of-context hooks and thread timers are delivered through this (the UI)
+    // thread's message loop. The hook reacts to taskbar clicks straight away; the
+    // timer catches the taskbar raising itself without becoming the foreground
+    // window, as it does when the Start menu opens or closes.
     unsafe {
+        SetTimer(0, 0, CHECK_MS, on_timer);
         SetWinEventHook(
             EVENT_SYSTEM_FOREGROUND,
             EVENT_SYSTEM_FOREGROUND,
@@ -455,7 +497,12 @@ fn amounts(ui: &mut egui::Ui, m: &Meter, size: f32) {
     });
 }
 
-fn provider_block(ui: &mut egui::Ui, p: Provider, slot: &Slot) {
+fn provider_block(
+    ui: &mut egui::Ui,
+    p: Provider,
+    slot: &Slot,
+    logos: &HashMap<Provider, egui::TextureHandle>,
+) {
     let single = slot
         .meters
         .as_ref()
@@ -463,6 +510,7 @@ fn provider_block(ui: &mut egui::Ui, p: Provider, slot: &Slot) {
         .map(|m| &m[0]);
 
     ui.horizontal(|ui| {
+        provider_logo(ui, p, logos);
         let name = RichText::new(p.name()).size(13.0).strong().color(TEXT);
         ui.label(name);
         if slot.loading {
@@ -754,6 +802,12 @@ fn logo_color(p: Provider) -> Color32 {
     }
 }
 
+fn provider_logo(ui: &mut egui::Ui, p: Provider, logos: &HashMap<Provider, egui::TextureHandle>) {
+    if let Some(logo) = logos.get(&p) {
+        ui.add(egui::Image::new((logo.id(), Vec2::splat(13.0))).tint(logo_color(p)));
+    }
+}
+
 /// The minimized view: "<logo> COP 42%  <logo> CLD 17%  <logo> CDX 99%" on one line.
 fn compact_row(
     ui: &mut egui::Ui,
@@ -766,9 +820,7 @@ fn compact_row(
             ui.add_space(8.0);
         }
         let slot = slots.get(p).cloned().unwrap_or_default();
-        if let Some(logo) = logos.get(p) {
-            ui.add(egui::Image::new((logo.id(), Vec2::splat(13.0))).tint(logo_color(*p)));
-        }
+        provider_logo(ui, *p, logos);
         ui.label(RichText::new(p.short_name()).size(11.5).color(MUTED));
         // The most-used meter is the one that matters when space is this tight.
         let pct = slot
@@ -895,7 +947,7 @@ impl eframe::App for App {
                             ui.add_space(5.0);
                         }
                         let slot = self.slots.get(p).cloned().unwrap_or_default();
-                        provider_block(ui, *p, &slot);
+                        provider_block(ui, *p, &slot, &self.logos);
                     }
 
                     ui.add_space(4.0);
