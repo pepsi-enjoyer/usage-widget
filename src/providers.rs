@@ -124,7 +124,7 @@ pub fn money(v: f64) -> String {
 // HTTP plumbing
 // ---------------------------------------------------------------------------
 
-fn agent() -> ureq::Agent {
+pub(crate) fn agent() -> ureq::Agent {
     use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
     // The OS TLS stack (SChannel on Windows) trusting the OS certificate store, so
     // corporate TLS-inspecting proxies whose root is installed there just work.
