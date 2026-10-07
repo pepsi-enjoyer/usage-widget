@@ -5,6 +5,7 @@
 
 mod providers;
 mod timeutil;
+mod update;
 
 use eframe::egui::{
     self, Align, Color32, CornerRadius, Layout, Margin, PointerButton, Pos2, RichText, Sense,
@@ -12,6 +13,8 @@ use eframe::egui::{
 };
 use providers::{FetchError, Meter, Problem, Provider, Unit, money};
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::Duration;
 use timeutil::{ago, now_unix};
@@ -59,6 +62,8 @@ struct App {
     /// Compact single-line view. Persisted, so the widget reopens the way it was left.
     minimized: bool,
     logos: HashMap<Provider, egui::TextureHandle>,
+    /// Set once an update has been installed; the UI thread then restarts.
+    restart: Arc<AtomicBool>,
 }
 
 impl App {
@@ -67,6 +72,10 @@ impl App {
         let (tx, rx) = mpsc::channel();
         let (refresh_tx, refresh_rx) = mpsc::channel();
         spawn_worker(cc.egui_ctx.clone(), tx, refresh_rx, interval);
+        let restart = Arc::new(AtomicBool::new(false));
+        if update::auto_enabled() {
+            spawn_auto_update(cc.egui_ctx.clone(), restart.clone());
+        }
         // Selectable labels grab clicks and drags, so right-click and drag-to-move
         // would not work over text.
         cc.egui_ctx
@@ -94,7 +103,31 @@ impl App {
             settled: false,
             minimized,
             logos: load_logos(&cc.egui_ctx),
+            restart,
         }
+    }
+
+    /// Runs a check from the menu in the background and reports the result.
+    fn check_for_updates(&self, ctx: &egui::Context) {
+        let ctx = ctx.clone();
+        let restart = self.restart.clone();
+        std::thread::spawn(move || match update::check_and_install() {
+            Ok(update::Outcome::UpToDate) => message_box(
+                &format!("You have the latest version ({}).", update::CURRENT),
+                false,
+            ),
+            Ok(update::Outcome::NotReady(v)) => message_box(
+                &format!(
+                    "Version {v} is out, but its download is not ready yet. Try again in a few minutes."
+                ),
+                false,
+            ),
+            Ok(update::Outcome::Installed) => {
+                restart.store(true, Ordering::SeqCst);
+                ctx.request_repaint();
+            }
+            Err(e) => message_box(&format!("Could not check for updates: {e}"), true),
+        });
     }
 
     fn refresh_now(&mut self) {
@@ -185,6 +218,22 @@ fn spawn_worker(
                 Err(RecvTimeoutError::Disconnected) => return,
             }
             while refresh_rx.try_recv().is_ok() {}
+        }
+    });
+}
+
+/// Checks for updates shortly after start and then every few hours, installing
+/// any newer release. Failures are ignored and retried at the next check.
+fn spawn_auto_update(ctx: egui::Context, restart: Arc<AtomicBool>) {
+    std::thread::spawn(move || {
+        std::thread::sleep(update::FIRST_CHECK_AFTER);
+        loop {
+            if let Ok(update::Outcome::Installed) = update::check_and_install() {
+                restart.store(true, Ordering::SeqCst);
+                ctx.request_repaint();
+                return;
+            }
+            std::thread::sleep(update::CHECK_EVERY);
         }
     });
 }
@@ -591,6 +640,7 @@ enum MenuAction {
     ToggleMinimized,
     Open(Provider),
     Size(f32),
+    CheckForUpdates,
     Quit,
 }
 
@@ -642,6 +692,7 @@ fn native_menu(
     const ID_REFRESH: usize = 1;
     const ID_QUIT: usize = 2;
     const ID_MINIMIZE: usize = 3;
+    const ID_UPDATE: usize = 4;
     const ID_OPEN: usize = 10;
     const ID_SIZE: usize = 100;
 
@@ -679,9 +730,12 @@ fn native_menu(
             );
         }
         add(menu, MF_POPUP, sizes as usize, "Size");
+        add(menu, MF_STRING, ID_UPDATE, "Check for updates");
         add(menu, MF_SEPARATOR, 0, "");
         let note = format!("Refreshes every {refresh_mins} min");
         add(menu, MF_STRING | MF_GRAYED, 0, &note);
+        let version = format!("Version {}", update::CURRENT);
+        add(menu, MF_STRING | MF_GRAYED, 0, &version);
         add(menu, MF_STRING, ID_QUIT, "Quit");
 
         let mut pt = Point::default();
@@ -704,6 +758,7 @@ fn native_menu(
         match id {
             ID_REFRESH => Some(MenuAction::Refresh),
             ID_MINIMIZE => Some(MenuAction::ToggleMinimized),
+            ID_UPDATE => Some(MenuAction::CheckForUpdates),
             ID_QUIT => Some(MenuAction::Quit),
             _ if (ID_OPEN..ID_OPEN + Provider::ALL.len()).contains(&id) => {
                 Some(MenuAction::Open(Provider::ALL[id - ID_OPEN]))
@@ -745,9 +800,17 @@ fn egui_menu(
             }
         }
     });
+    if ui.button("Check for updates").clicked() {
+        action = Some(MenuAction::CheckForUpdates);
+    }
     ui.separator();
     ui.label(
         RichText::new(format!("refreshes every {refresh_mins} min"))
+            .size(10.0)
+            .color(MUTED),
+    );
+    ui.label(
+        RichText::new(format!("version {}", update::CURRENT))
             .size(10.0)
             .color(MUTED),
     );
@@ -1032,19 +1095,31 @@ impl eframe::App for App {
             Some(MenuAction::ToggleMinimized) => self.minimized = !self.minimized,
             Some(MenuAction::Open(p)) => open_url(p.url()),
             Some(MenuAction::Size(z)) => ctx.set_zoom_factor(z),
+            Some(MenuAction::CheckForUpdates) => self.check_for_updates(&ctx),
             Some(MenuAction::Quit) => ctx.send_viewport_cmd(ViewportCommand::Close),
             None => {}
         }
         if refresh {
             self.refresh_now();
         }
+        // Closing normally lets eframe save position and size before the new
+        // version, which waits for this process to exit, starts up.
+        if self.restart.swap(false, Ordering::SeqCst) {
+            match update::restart() {
+                Ok(()) => ctx.send_viewport_cmd(ViewportCommand::Close),
+                Err(e) => message_box(&format!("Updated, but {e}"), true),
+            }
+        }
     }
 }
 
 fn main() -> eframe::Result {
+    let mut wait_for_exit = Duration::ZERO;
     match std::env::args().nth(1).as_deref() {
         Some("--startup") => return finish(set_run_at_login(true)),
         Some("--no-startup") => return finish(set_run_at_login(false)),
+        // Started by the previous version after an update; it is still closing.
+        Some("--updated") => wait_for_exit = Duration::from_secs(30),
         Some(flag) => {
             return finish(Err(format!(
                 "unknown flag {flag}
@@ -1055,9 +1130,10 @@ usage: usage-widget [--startup | --no-startup]"
         None => {}
     }
 
-    if !claim_single_instance() {
+    if !claim_single_instance(wait_for_exit) {
         return Ok(());
     }
+    update::cleanup();
 
     let options = eframe::NativeOptions {
         persist_window: true,
@@ -1113,25 +1189,38 @@ fn set_opacity(hwnd: isize) {
 
 /// Holds a named mutex for the life of the process; returns false if another
 /// instance already holds it (e.g. launched again, or at login while running).
+/// Keeps trying for up to `wait`, for when the other instance is about to exit.
 #[cfg(windows)]
-fn claim_single_instance() -> bool {
+fn claim_single_instance(wait: Duration) -> bool {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn CreateMutexW(attrs: *const core::ffi::c_void, owner: i32, name: *const u16) -> isize;
         fn GetLastError() -> u32;
+        fn CloseHandle(handle: isize) -> i32;
     }
     const ERROR_ALREADY_EXISTS: u32 = 183;
 
     let name = wide(r"Local\usage-widget-single-instance");
-    // The handle is deliberately never closed; Windows releases it on exit.
-    unsafe {
-        let handle = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
-        handle == 0 || GetLastError() != ERROR_ALREADY_EXISTS
+    let start = std::time::Instant::now();
+    loop {
+        // The handle is deliberately never closed once claimed; Windows releases it on exit.
+        unsafe {
+            let handle = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
+            if handle == 0 || GetLastError() != ERROR_ALREADY_EXISTS {
+                return true;
+            }
+            // Our own handle would keep the mutex alive, so drop it before retrying.
+            CloseHandle(handle);
+        }
+        if start.elapsed() >= wait {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(250));
     }
 }
 
 #[cfg(not(windows))]
-fn claim_single_instance() -> bool {
+fn claim_single_instance(_wait: Duration) -> bool {
     true
 }
 
@@ -1193,23 +1282,44 @@ fn finish(result: Result<String, String>) -> eframe::Result {
         Ok(msg) => (msg.clone(), false),
         Err(msg) => (msg.clone(), true),
     };
-    #[cfg(windows)]
-    {
-        #[link(name = "user32")]
-        unsafe extern "system" {
-            fn MessageBoxW(hwnd: isize, text: *const u16, caption: *const u16, flags: u32) -> i32;
-        }
-        let text_w = wide(&text);
-        let caption_w = wide("usage-widget");
-        let icon = if is_err { 0x10 } else { 0x40 }; // MB_ICONERROR / MB_ICONINFORMATION
-        unsafe {
-            MessageBoxW(0, text_w.as_ptr(), caption_w.as_ptr(), icon);
-        }
-    }
+    message_box(&text, is_err);
     if is_err {
         eprintln!("{text}");
         std::process::exit(1);
     }
     println!("{text}");
     Ok(())
+}
+
+/// Shows a message box on Windows; elsewhere the text goes to stderr.
+fn message_box(text: &str, is_err: bool) {
+    #[cfg(windows)]
+    {
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn MessageBoxW(hwnd: isize, text: *const u16, caption: *const u16, flags: u32) -> i32;
+        }
+        const MB_ICONERROR: u32 = 0x10;
+        const MB_ICONINFORMATION: u32 = 0x40;
+        // Without an owner window the box could open behind the always-on-top widget.
+        const MB_SETFOREGROUND: u32 = 0x1_0000;
+        const MB_TOPMOST: u32 = 0x4_0000;
+        let text_w = wide(text);
+        let caption_w = wide("usage-widget");
+        let icon = if is_err {
+            MB_ICONERROR
+        } else {
+            MB_ICONINFORMATION
+        };
+        unsafe {
+            MessageBoxW(
+                0,
+                text_w.as_ptr(),
+                caption_w.as_ptr(),
+                icon | MB_SETFOREGROUND | MB_TOPMOST,
+            );
+        }
+    }
+    #[cfg(not(windows))]
+    eprintln!("{text}");
 }
