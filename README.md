@@ -1,6 +1,6 @@
 # usage-widget
 
-A small always-on-top Windows widget that shows how much of your GitHub Copilot,
+A small always-on-top Windows and macOS widget that shows how much of your GitHub Copilot,
 Claude and Codex allowance you have used.
 
 | Business plans | Personal subscriptions |
@@ -45,9 +45,11 @@ model, which uses a little of your allowance, then refreshes.
   Business/Enterprise): dollars spent against your limit, with a total at the bottom.
 - **Personal plans** (Claude Pro/Max, ChatGPT Plus/Pro): your 5-hour and weekly usage.
   The one you will run out of first is highlighted, the bar shows it, and the timer
-  shows when it resets. Copilot Pro shows its monthly allowance.
+  shows when it resets: a countdown for the 5-hour window, or a date and local time
+  for the weekly window. Copilot Pro shows its monthly allowance.
 
-Bars go green, yellow and red as you use more.
+Bars go green, yellow and red as you use more. Hover a service name for its plan,
+renewal date, exact reset times and additional caps. Click its name to open usage.
 
 ## Using it
 
@@ -56,11 +58,18 @@ Bars go green, yellow and red as you use more.
   updates, open each service's usage page, or quit.
 - Untick a service under Show in the right-click menu to hide it. Tick it again to
   bring it back.
+- On macOS, the menu bar menu also hides and shows the widget.
 - Hover a red error to see the full message.
 - Hover a personal plan's countdown, or a window's percentage or label, to see when
   that window resets.
+- `usage-widget usage` prints the same numbers as JSON without opening a window.
+  The [usage-widget skill](skills/usage-widget/SKILL.md) lets agents read it.
 
-Optional settings, as environment variables:
+Run `usage-widget config` to edit refresh interval, opacity, percentage precision
+and provider settings. Claude's renewal date is optional; see
+[settings and renewals](docs/usage-details.md).
+
+Environment variables override the matching config settings:
 
 | Variable | Does | Default |
 | --- | --- | --- |
