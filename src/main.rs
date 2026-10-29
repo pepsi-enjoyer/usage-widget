@@ -4,11 +4,16 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod config;
 mod limits;
+#[cfg(target_os = "macos")]
+mod menubar;
+mod paths;
 mod providers;
 mod timeutil;
 mod update;
 
+use config::Config;
 use eframe::egui::{
     self, Align, Color32, CornerRadius, Layout, Margin, PointerButton, Pos2, RichText, Sense,
     Shape, Stroke, Vec2, ViewportBuilder, ViewportCommand,
@@ -23,8 +28,6 @@ use timeutil::{ago, now_unix, until, until_next_minute};
 
 const WIDTH: f32 = 250.0;
 const MARGIN: i8 = 12;
-const DEFAULT_REFRESH_MINS: u64 = 5;
-const DEFAULT_OPACITY_PERCENT: u32 = 85;
 const MINI_MARGIN_X: i8 = 10;
 const MINI_MARGIN_Y: i8 = 6;
 const MINIMIZED_KEY: &str = "minimized";
@@ -76,6 +79,8 @@ impl Slot {
 }
 
 struct App {
+    /// Services enabled in the config, in display order.
+    providers: Vec<Provider>,
     slots: HashMap<Provider, Slot>,
     rx: Receiver<Update>,
     refresh_tx: Sender<()>,
@@ -96,14 +101,48 @@ struct App {
     /// Services whose token is being refreshed, so a second click does not
     /// start another run.
     refreshing: Arc<Mutex<HashSet<Provider>>>,
+    opacity: u32,
+    /// Decimal places for percentages.
+    precision: usize,
+    config_error: Option<String>,
+    #[cfg(target_os = "macos")]
+    menubar: Option<menubar::MenuBar>,
+    /// Whether the window is on screen; the menu bar icon can hide it.
+    #[cfg(target_os = "macos")]
+    shown: bool,
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let interval = Duration::from_secs(60 * refresh_minutes());
+    fn new(cc: &eframe::CreationContext<'_>, config: Config, config_error: Option<String>) -> Self {
+        #[cfg(windows)]
+        {
+            use winit::platform::windows::WindowExtWindows;
+            // egui enables this for frameless windows; winit reserves a visible
+            // 1px strip at the top to draw it, even with the DWM border disabled.
+            if let Some(window) = cc.winit_window() {
+                window.set_undecorated_shadow(false);
+            }
+        }
+
+        let providers: Vec<Provider> = Provider::ALL
+            .into_iter()
+            .filter(|p| config.enabled(*p))
+            .collect();
+        let interval = config.refresh_interval();
+        let opacity = std::env::var("USAGE_WIDGET_OPACITY")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(config.opacity);
+        let precision = config.precision.min(3);
         let (tx, rx) = mpsc::channel();
         let (refresh_tx, refresh_rx) = mpsc::channel();
-        spawn_worker(cc.egui_ctx.clone(), tx, refresh_rx, interval);
+        spawn_worker(
+            cc.egui_ctx.clone(),
+            tx,
+            refresh_rx,
+            providers.clone(),
+            interval,
+        );
         let restart = Arc::new(AtomicBool::new(false));
         if update::auto_enabled() {
             spawn_auto_update(cc.egui_ctx.clone(), restart.clone());
@@ -125,17 +164,23 @@ impl App {
             .and_then(|s| eframe::get_value(s, HIDDEN_KEY))
             .unwrap_or_default();
 
-        let mut slots = HashMap::new();
-        for p in Provider::ALL {
-            slots.insert(
-                p,
-                Slot {
+        let slots = providers
+            .iter()
+            .map(|p| {
+                let slot = Slot {
                     loading: true,
                     ..Default::default()
-                },
-            );
-        }
+                };
+                (*p, slot)
+            })
+            .collect();
+        #[cfg(target_os = "macos")]
+        let (menubar, config_error) = match menubar::MenuBar::new(&cc.egui_ctx, &providers) {
+            Ok(bar) => (Some(bar), config_error),
+            Err(e) => (None, config_error.or(Some(format!("menu bar icon: {e}")))),
+        };
         Self {
+            providers,
             slots,
             rx,
             refresh_tx,
@@ -147,6 +192,95 @@ impl App {
             hidden,
             restart,
             refreshing: Arc::default(),
+            opacity,
+            precision,
+            config_error,
+            #[cfg(target_os = "macos")]
+            menubar,
+            #[cfg(target_os = "macos")]
+            shown: true,
+        }
+    }
+
+    /// An App with no window and no menu bar, plus the far ends of its channels.
+    #[cfg(test)]
+    fn for_test(providers: Vec<Provider>) -> (Self, Sender<Update>, Receiver<()>) {
+        let (updates, rx) = mpsc::channel();
+        let (refresh_tx, refresh_rx) = mpsc::channel();
+        let slots = providers.iter().map(|p| (*p, Slot::default())).collect();
+        let app = Self {
+            providers,
+            slots,
+            rx,
+            refresh_tx,
+            interval: Duration::from_secs(300),
+            ratios: HashMap::new(),
+            hidden: HashSet::new(),
+            restart: Arc::new(AtomicBool::new(false)),
+            refreshing: Arc::default(),
+            opacity: 100,
+            precision: 0,
+            config_error: None,
+            settled: true,
+            minimized: false,
+            logos: HashMap::new(),
+            #[cfg(target_os = "macos")]
+            menubar: None,
+            #[cfg(target_os = "macos")]
+            shown: true,
+        };
+        (app, updates, refresh_rx)
+    }
+
+    /// Menu bar clicks. Called from `logic`, which runs before every `ui` pass
+    /// and also while the widget is hidden, when eframe runs no egui pass at
+    /// all, so handling these in `ui` would leave a hidden widget with no way
+    /// back.
+    #[cfg(target_os = "macos")]
+    fn handle_menu(&mut self, ctx: &egui::Context) {
+        let Some(actions) = self.menubar.as_ref().map(menubar::MenuBar::take_actions) else {
+            return;
+        };
+        for action in actions {
+            match action {
+                menubar::Action::ToggleWidget => {
+                    self.shown = !self.shown;
+                    ctx.send_viewport_cmd(ViewportCommand::Visible(self.shown));
+                    if self.shown {
+                        self.settled = false;
+                    }
+                    if let Some(bar) = &self.menubar {
+                        bar.set_widget_shown(self.shown);
+                    }
+                }
+                menubar::Action::Refresh => self.refresh_now(),
+                menubar::Action::Open(p) => open_url(p.url()),
+                menubar::Action::EditConfig => self.edit_config(),
+                menubar::Action::Quit => ctx.send_viewport_cmd(ViewportCommand::Close),
+                menubar::Action::Widget(action) => self.apply_action(action, ctx),
+            }
+        }
+    }
+
+    /// A choice from the right-click menu.
+    fn apply_action(&mut self, action: MenuAction, ctx: &egui::Context) {
+        match action {
+            MenuAction::Refresh => self.refresh_now(),
+            MenuAction::RefreshToken(p) => self.refresh_token(p),
+            MenuAction::ToggleMinimized => self.minimized = !self.minimized,
+            MenuAction::Open(p) => open_url(p.url()),
+            MenuAction::Toggle(p) => self.toggle(p),
+            MenuAction::Size(z) => ctx.set_zoom_factor(z),
+            MenuAction::CheckForUpdates => self.check_for_updates(ctx),
+            MenuAction::EditConfig => self.edit_config(),
+            MenuAction::Quit => ctx.send_viewport_cmd(ViewportCommand::Close),
+        }
+    }
+
+    /// Opens the config in the system editor; it applies on the next start.
+    fn edit_config(&mut self) {
+        if let Err(e) = config::open(false) {
+            self.config_error = Some(e);
         }
     }
 
@@ -258,8 +392,9 @@ impl App {
     /// The services the account has, in display order. These are listed in the
     /// menu, ticked or not.
     fn found(&self) -> Vec<Provider> {
-        Provider::ALL
-            .into_iter()
+        self.providers
+            .iter()
+            .copied()
             .filter(|p| self.slots.get(p).is_some_and(Slot::visible))
             .collect()
     }
@@ -274,7 +409,9 @@ impl App {
     /// What the widget says when it has no service to show, in the full and the
     /// minimized view.
     fn empty_text(&self, found: &[Provider]) -> (&'static str, &'static str) {
-        if !found.is_empty() {
+        if self.providers.is_empty() {
+            ("Every service is disabled in the config.", "All disabled")
+        } else if !found.is_empty() {
             (
                 "All services are hidden. Right-click to show them.",
                 "All hidden",
@@ -304,6 +441,74 @@ impl App {
         self.slots.values().filter_map(|s| s.updated).max()
     }
 
+    /// Wide enough for the longest header or meter line, so extra decimal places
+    /// widen the card instead of being clipped.
+    fn card_width(&self, ctx: &egui::Context, shown: &[Provider]) -> f32 {
+        ctx.fonts_mut(|fonts| {
+            let mut text_width = |text: String, size| {
+                fonts
+                    .layout_no_wrap(text, egui::FontId::proportional(size), TEXT)
+                    .size()
+                    .x
+            };
+            shown
+                .iter()
+                .filter_map(|p| {
+                    let slot = self.slots.get(p)?;
+                    let mut width = 13.0 + 8.0 + text_width(p.name().into(), 13.0);
+                    let mut lines = Vec::new();
+                    match &slot.usage {
+                        Some(u) if u.personal => {
+                            if let Some(at) = u
+                                .meters
+                                .get(self.binding(*p).unwrap_or(0))
+                                .and_then(|m| m.resets_at)
+                            {
+                                width += 8.0 + text_width(format!("({})", until(at)), 11.0);
+                            }
+                            width += 8.0;
+                            for (i, m) in u.meters.iter().enumerate() {
+                                if i > 0 {
+                                    width += 6.0 + text_width("|".into(), 12.0);
+                                }
+                                width +=
+                                    text_width(percent_label(m.percent(), self.precision), 12.0);
+                                if let Some(label) = &m.label {
+                                    width += 3.0 + text_width(label.clone(), 12.0);
+                                }
+                            }
+                        }
+                        Some(u) => {
+                            for m in &u.meters {
+                                let mut line =
+                                    text_width(percent_label(m.percent(), self.precision), 12.0);
+                                if m.unit != Unit::Percent {
+                                    line += 8.0 + text_width(m.summary(), 12.0);
+                                }
+                                if let Some(label) = &m.label {
+                                    line += 8.0 + text_width(label.clone(), 11.0);
+                                }
+                                lines.push(line);
+                            }
+                            // A single unlabelled meter shares the header line.
+                            if let [m] = u.meters.as_slice()
+                                && m.label.is_none()
+                            {
+                                width += 8.0 + lines.pop().unwrap_or_default();
+                            }
+                        }
+                        None => {}
+                    }
+                    if let Some(e) = &slot.error {
+                        width += 8.0 + text_width(e.problem.label().into(), 12.0);
+                    }
+                    let widest = lines.into_iter().fold(width, f32::max);
+                    Some(widest + 2.0 * f32::from(MARGIN))
+                })
+                .fold(WIDTH, f32::max)
+        })
+    }
+
     /// Sum of every dollar-denominated meter across the shown providers. Only when
     /// at least two have one, since otherwise it repeats that provider's line.
     fn total(&self, shown: &[Provider]) -> Option<Meter> {
@@ -331,24 +536,17 @@ impl App {
     }
 }
 
-fn refresh_minutes() -> u64 {
-    std::env::var("USAGE_WIDGET_REFRESH_MINS")
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .filter(|m| *m >= 1)
-        .unwrap_or(DEFAULT_REFRESH_MINS)
-}
-
 fn spawn_worker(
     ctx: egui::Context,
     tx: Sender<Update>,
     refresh_rx: Receiver<()>,
+    providers: Vec<Provider>,
     interval: Duration,
 ) {
     std::thread::spawn(move || {
         loop {
             std::thread::scope(|s| {
-                for p in Provider::ALL {
+                for &p in &providers {
                     let tx = tx.clone();
                     let ctx = ctx.clone();
                     s.spawn(move || {
@@ -413,10 +611,10 @@ const SWP_NOMOVE: u32 = 0x2;
 const SWP_NOACTIVATE: u32 = 0x10;
 
 /// Windows 11: round the window corners and drop the 1px accent border, so the
-/// frameless window looks like a floating card without needing transparency.
+/// frameless window looks like a floating card, and apply the opacity.
 /// Also puts the window back on top if something has dropped its topmost style.
 #[cfg(windows)]
-fn apply_windows_chrome(frame: &eframe::Frame) {
+fn apply_windows_chrome(frame: &eframe::Frame, opacity: u32) {
     #[link(name = "user32")]
     unsafe extern "system" {
         fn GetWindowLongPtrW(hwnd: isize, index: i32) -> isize;
@@ -443,7 +641,7 @@ fn apply_windows_chrome(frame: &eframe::Frame) {
     let Some(hwnd) = hwnd(frame) else {
         return;
     };
-    set_opacity(hwnd);
+    set_opacity(hwnd, opacity);
     unsafe {
         if GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST == 0 {
             SetWindowPos(
@@ -481,8 +679,33 @@ fn apply_windows_chrome(frame: &eframe::Frame) {
     }
 }
 
-#[cfg(not(windows))]
-fn apply_windows_chrome(_frame: &eframe::Frame) {}
+/// macOS: the same whole-window opacity as on Windows, through the NSWindow's
+/// alpha.
+#[cfg(target_os = "macos")]
+fn apply_windows_chrome(frame: &eframe::Frame, opacity: u32) {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let Ok(handle) = frame.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
+        return;
+    };
+    let view = appkit.ns_view.as_ptr().cast::<AnyObject>();
+    let alpha = f64::from(opacity.clamp(20, 100)) / 100.0;
+    // SAFETY: `ns_view` is the live NSView eframe draws into, and `ui` runs on
+    // the main thread.
+    unsafe {
+        let window: *mut AnyObject = msg_send![view, window];
+        if !window.is_null() {
+            let _: () = msg_send![window, setAlphaValue: alpha];
+        }
+    }
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn apply_windows_chrome(_frame: &eframe::Frame, _opacity: u32) {}
 
 /// Runs when the window is first visible and after each self-resize. Pulls it
 /// fully onto the nearest monitor's work area, since the saved position can point
@@ -710,13 +933,17 @@ fn bar(ui: &mut egui::Ui, fraction: f32, color: Color32) {
     }
 }
 
+fn percent_label(pct: f64, precision: usize) -> String {
+    format!("{pct:.precision$}%")
+}
+
 /// "$523.54 / $1,000   52%" right-aligned, coloured by level.
-fn amounts(ui: &mut egui::Ui, m: &Meter, size: f32) {
+fn amounts(ui: &mut egui::Ui, m: &Meter, size: f32, precision: usize) {
     let pct = m.percent();
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
         if m.total > 0.0 {
             ui.label(
-                RichText::new(format!("{pct:.0}%"))
+                RichText::new(percent_label(pct, precision))
                     .size(size)
                     .strong()
                     .color(level_color(pct)),
@@ -732,7 +959,7 @@ fn amounts(ui: &mut egui::Ui, m: &Meter, size: f32) {
 
 /// "42% 5h | 17% wk" right-aligned: each window's percentage coloured by level,
 /// followed by its label, each faded by its weight (see `weighted`).
-fn windows(ui: &mut egui::Ui, meters: &[Meter], weights: &[f32], size: f32) {
+fn windows(ui: &mut egui::Ui, meters: &[Meter], weights: &[f32], size: f32, precision: usize) {
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
         ui.spacing_mut().item_spacing.x = 3.0;
         // Laid out right to left, so the last window goes first.
@@ -747,7 +974,7 @@ fn windows(ui: &mut egui::Ui, meters: &[Meter], weights: &[f32], size: f32) {
                 }
                 let pct = m.percent();
                 ui.label(
-                    RichText::new(format!("{pct:.0}%"))
+                    RichText::new(percent_label(pct, precision))
                         .size(size)
                         .strong()
                         .color(weighted(level_color(pct), w)),
@@ -809,6 +1036,7 @@ fn provider_block(
     ui: &mut egui::Ui,
     p: Provider,
     slot: &Slot,
+    precision: usize,
     logos: &HashMap<Provider, egui::TextureHandle>,
     binding: Option<usize>,
 ) {
@@ -830,7 +1058,13 @@ fn provider_block(
     ui.horizontal(|ui| {
         provider_logo(ui, p, logos);
         let name = RichText::new(p.name()).size(13.0).strong().color(TEXT);
-        ui.label(name);
+        // The name opens the service's usage page.
+        let name = ui
+            .add(egui::Label::new(name).sense(Sense::click()))
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        if name.clicked() {
+            open_url(p.url());
+        }
         if let Some(m) = selected
             && let Some(at) = m.resets_at
         {
@@ -844,9 +1078,9 @@ fn provider_block(
             ui.add(egui::Spinner::new().size(10.0).color(MUTED));
         }
         if let Some(meters) = personal {
-            windows(ui, meters, &weights, 12.0);
+            windows(ui, meters, &weights, 12.0, precision);
         } else if let Some(m) = single {
-            amounts(ui, m, 12.0);
+            amounts(ui, m, 12.0, precision);
         }
         if let Some(e) = &slot.error {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -883,7 +1117,7 @@ fn provider_block(
                     if let Some(label) = &m.label {
                         ui.label(RichText::new(label).size(11.0).color(MUTED));
                     }
-                    amounts(ui, m, 12.0);
+                    amounts(ui, m, 12.0, precision);
                 });
                 if m.total > 0.0 {
                     bar(ui, m.fraction(), level_color(m.percent()));
@@ -905,6 +1139,7 @@ enum MenuAction {
     Toggle(Provider),
     Size(f32),
     CheckForUpdates,
+    EditConfig,
     Quit,
 }
 
@@ -959,6 +1194,7 @@ fn native_menu(
     const ID_QUIT: usize = 2;
     const ID_MINIMIZE: usize = 3;
     const ID_UPDATE: usize = 4;
+    const ID_EDIT_CONFIG: usize = 5;
     const ID_OPEN: usize = 10;
     const ID_TOGGLE: usize = 20;
     const ID_TOKEN: usize = 30;
@@ -1028,6 +1264,7 @@ fn native_menu(
         add(menu, MF_STRING | MF_GRAYED, 0, &note);
         let version = format!("Version {}", update::CURRENT);
         add(menu, MF_STRING | MF_GRAYED, 0, &version);
+        add(menu, MF_STRING, ID_EDIT_CONFIG, "Edit config");
         add(menu, MF_STRING, ID_QUIT, "Quit");
 
         let mut pt = Point::default();
@@ -1051,6 +1288,7 @@ fn native_menu(
             ID_REFRESH => Some(MenuAction::Refresh),
             ID_MINIMIZE => Some(MenuAction::ToggleMinimized),
             ID_UPDATE => Some(MenuAction::CheckForUpdates),
+            ID_EDIT_CONFIG => Some(MenuAction::EditConfig),
             ID_QUIT => Some(MenuAction::Quit),
             _ if (ID_OPEN..ID_OPEN + Provider::ALL.len()).contains(&id) => {
                 Some(MenuAction::Open(Provider::ALL[id - ID_OPEN]))
@@ -1069,7 +1307,7 @@ fn native_menu(
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn egui_menu(
     ui: &mut egui::Ui,
     found: &[Provider],
@@ -1135,6 +1373,9 @@ fn egui_menu(
             .size(10.0)
             .color(MUTED),
     );
+    if ui.button("Edit config").clicked() {
+        action = Some(MenuAction::EditConfig);
+    }
     if ui.button("Quit").clicked() {
         action = Some(MenuAction::Quit);
     }
@@ -1229,6 +1470,7 @@ fn compact_row(
     providers: &[Provider],
     slots: &HashMap<Provider, Slot>,
     logos: &HashMap<Provider, egui::TextureHandle>,
+    precision: usize,
     bindings: &HashMap<Provider, usize>,
     empty: &str,
 ) {
@@ -1256,7 +1498,7 @@ fn compact_row(
                 .reduce(f64::max),
         };
         let text = match (pct, &slot.error) {
-            (Some(pct), _) => RichText::new(format!("{pct:.0}%")).color(level_color(pct)),
+            (Some(pct), _) => RichText::new(percent_label(pct, precision)).color(level_color(pct)),
             (None, Some(_)) => RichText::new("!").color(ERR),
             (None, None) => RichText::new("…").color(MUTED),
         };
@@ -1303,6 +1545,11 @@ fn refresh_button(ui: &mut egui::Ui) -> bool {
 }
 
 impl eframe::App for App {
+    #[cfg(target_os = "macos")]
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.handle_menu(ctx);
+    }
+
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, MINIMIZED_KEY, &self.minimized);
         eframe::set_value(storage, RATIOS_KEY, &self.ratios);
@@ -1310,13 +1557,19 @@ impl eframe::App for App {
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        BG.to_normalized_gamma_f32()
+        // The macOS window is transparent so the panel's rounded corners show;
+        // elsewhere the window is opaque and painted entirely in BG.
+        if cfg!(target_os = "macos") {
+            [0.0, 0.0, 0.0, 0.0]
+        } else {
+            BG.to_normalized_gamma_f32()
+        }
     }
 
     fn ui(&mut self, root: &mut egui::Ui, frame: &mut eframe::Frame) {
         // Cheap and idempotent; re-applied every frame because winit rewrites the
         // window styles whenever its own flags change (focus, level, visibility).
-        apply_windows_chrome(frame);
+        apply_windows_chrome(frame, self.opacity);
         self.drain();
         let ctx = root.ctx().clone();
         // Repaints only to keep the text current: "updated 5m ago" every 30s, and
@@ -1334,9 +1587,15 @@ impl eframe::App for App {
         } else {
             Margin::same(MARGIN)
         };
-        let panel = egui::Frame::NONE.fill(BG).inner_margin(margin);
+        let panel = egui::Frame::NONE
+            .fill(BG)
+            .inner_margin(margin)
+            .corner_radius(if cfg!(target_os = "macos") { 8 } else { 0 });
 
         let mut refresh = false;
+        // On macOS the right-click choice arrives through the menu bar's
+        // clicks instead, so this stays unset there.
+        #[cfg_attr(target_os = "macos", allow(unused_mut))]
         let mut action = None;
         let zoom = ctx.zoom_factor();
         let refresh_mins = self.interval.as_secs() / 60;
@@ -1348,6 +1607,15 @@ impl eframe::App for App {
             .filter_map(|&p| Some((p, self.binding(p)?)))
             .collect();
         let (empty, empty_compact) = self.empty_text(&found);
+        let full_width = self.card_width(&ctx, &providers);
+
+        // Checked on the raw pointer so a right-click over any widget counts.
+        #[cfg(target_os = "macos")]
+        let right_clicked = ctx.input(|i| i.pointer.button_clicked(PointerButton::Secondary));
+        #[cfg(target_os = "macos")]
+        if let Some(bar) = &self.menubar {
+            bar.set_services(&found, &providers);
+        }
 
         egui::CentralPanel::default().frame(panel).show(root, |ui| {
             // Whole background is a drag handle and a right-click menu target.
@@ -1362,7 +1630,7 @@ impl eframe::App for App {
             if ui.input(|i| i.pointer.button_clicked(PointerButton::Secondary)) {
                 action = native_menu(frame, &found, &providers, zoom, refresh_mins, minimized);
             }
-            #[cfg(not(windows))]
+            #[cfg(all(not(windows), not(target_os = "macos")))]
             bg.context_menu(|ui| {
                 action = egui_menu(ui, &found, &providers, zoom, refresh_mins, minimized);
                 if action.is_some() {
@@ -1381,12 +1649,14 @@ impl eframe::App for App {
                         &providers,
                         &self.slots,
                         &self.logos,
+                        self.precision,
                         &bindings,
                         empty_compact,
                     )
                 })
             } else {
                 ui.vertical(|ui| {
+                    ui.set_width(full_width - margin.sum().x);
                     if providers.is_empty() {
                         ui.label(RichText::new(empty).size(10.5).color(MUTED));
                     }
@@ -1395,8 +1665,18 @@ impl eframe::App for App {
                             ui.add_space(5.0);
                         }
                         if let Some(slot) = self.slots.get(p) {
-                            provider_block(ui, *p, slot, &self.logos, bindings.get(p).copied());
+                            provider_block(
+                                ui,
+                                *p,
+                                slot,
+                                self.precision,
+                                &self.logos,
+                                bindings.get(p).copied(),
+                            );
                         }
+                    }
+                    if let Some(err) = &self.config_error {
+                        ui.label(RichText::new(err).size(10.0).color(ERR));
                     }
 
                     ui.add_space(4.0);
@@ -1423,13 +1703,13 @@ impl eframe::App for App {
 
             // Grow or shrink the window to fit the content. Sizes are in points, so
             // this also resizes the window when the zoom factor changes. The compact
-            // row sizes the width to its content too; the full card has a fixed width.
+            // row sizes the width to its content too; the full card fits its widest line.
             let size = content.response.rect.size();
             let wanted = Vec2::new(
                 if minimized {
                     size.x + margin.sum().x
                 } else {
-                    WIDTH
+                    full_width
                 },
                 size.y + margin.sum().y,
             );
@@ -1442,16 +1722,15 @@ impl eframe::App for App {
             }
         });
 
-        match action {
-            Some(MenuAction::Refresh) => refresh = true,
-            Some(MenuAction::RefreshToken(p)) => self.refresh_token(p),
-            Some(MenuAction::ToggleMinimized) => self.minimized = !self.minimized,
-            Some(MenuAction::Open(p)) => open_url(p.url()),
-            Some(MenuAction::Toggle(p)) => self.toggle(p),
-            Some(MenuAction::Size(z)) => ctx.set_zoom_factor(z),
-            Some(MenuAction::CheckForUpdates) => self.check_for_updates(&ctx),
-            Some(MenuAction::Quit) => ctx.send_viewport_cmd(ViewportCommand::Close),
-            None => {}
+        // A native popup menu on macOS, since an egui menu is clipped to this
+        // small window. The choice arrives later through the menu bar's clicks.
+        #[cfg(target_os = "macos")]
+        if right_clicked && self.menubar.is_some() && !egui::Popup::is_any_open(&ctx) {
+            mac_menu(frame, self, zoom, refresh_mins, minimized);
+        }
+
+        if let Some(action) = action {
+            self.apply_action(action, &ctx);
         }
         if refresh {
             self.refresh_now();
@@ -1467,27 +1746,97 @@ impl eframe::App for App {
     }
 }
 
+/// Shows the right-click menu as a native popup at the cursor and blocks until
+/// it is dismissed. Unlike an egui menu it is not clipped to the window. The
+/// choice arrives later through `MenuBar::take_actions`.
+#[cfg(target_os = "macos")]
+fn mac_menu(frame: &eframe::Frame, app: &App, zoom: f32, refresh_mins: u64, minimized: bool) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let Some(bar) = &app.menubar else { return };
+    let Ok(handle) = frame.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
+        return;
+    };
+    // SAFETY: `ns_view` is the live NSView eframe draws into, and `ui` runs on
+    // the main thread.
+    unsafe {
+        bar.popup(
+            appkit.ns_view.as_ptr(),
+            &app.found(),
+            &app.shown(),
+            zoom,
+            refresh_mins,
+            minimized,
+        )
+    }
+}
+
+/// Reads the same subscription data as the widget without opening a window.
+fn print_usage() {
+    let (config, config_error) = config::load();
+    let mut providers = serde_json::Map::new();
+    for provider in Provider::ALL.into_iter().filter(|p| config.enabled(*p)) {
+        let result = match provider.fetch() {
+            Ok(usage) => serde_json::json!({ "usage": usage }),
+            Err(error) => serde_json::json!({
+                "error": error.problem.label(),
+                "detail": error.detail,
+            }),
+        };
+        providers.insert(provider.name().to_lowercase(), result);
+    }
+    println!(
+        "{}",
+        serde_json::json!({
+            "fetched_at": now_unix(),
+            "config_error": config_error,
+            "providers": providers,
+        })
+    );
+}
+
 fn main() -> eframe::Result {
     let mut wait_for_exit = Duration::ZERO;
     match std::env::args().nth(1).as_deref() {
+        Some("usage") => {
+            print_usage();
+            return Ok(());
+        }
+        Some("config") => {
+            return match config::open(true) {
+                Ok(path) => {
+                    println!("{}", path.display());
+                    Ok(())
+                }
+                Err(e) => finish(Err(e)),
+            };
+        }
         Some("--startup") => return finish(set_run_at_login(true)),
         Some("--no-startup") => return finish(set_run_at_login(false)),
         // Started by the previous version after an update; it is still closing.
         Some("--updated") => wait_for_exit = Duration::from_secs(30),
         Some(flag) => {
             return finish(Err(format!(
-                "unknown flag {flag}
+                "unknown argument {flag}
 
-usage: usage-widget [--startup | --no-startup]"
+usage: usage-widget [usage | config | --startup | --no-startup]"
             )));
         }
         None => {}
+    }
+
+    #[cfg(all(target_os = "macos", not(debug_assertions)))]
+    if detach_from_terminal() {
+        return Ok(());
     }
 
     if !claim_single_instance(wait_for_exit) {
         return Ok(());
     }
     update::cleanup();
+    let (config, config_error) = config::load();
 
     let options = eframe::NativeOptions {
         persist_window: true,
@@ -1496,23 +1845,69 @@ usage: usage-widget [--startup | --no-startup]"
             .with_title("Usage")
             .with_inner_size([WIDTH, 180.0])
             .with_decorations(false)
+            .with_transparent(cfg!(target_os = "macos"))
             .with_always_on_top()
             .with_taskbar(false)
             .with_resizable(false),
+        // An accessory app on macOS: no Dock icon or Cmd+Tab entry; the menu
+        // bar icon stands in for them.
+        #[cfg(target_os = "macos")]
+        event_loop_builder: Some(Box::new(|builder| {
+            use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
+            builder.with_activation_policy(ActivationPolicy::Accessory);
+        })),
         ..Default::default()
     };
     eframe::run_native(
         "usage-widget",
         options,
-        Box::new(|cc| Ok(Box::new(App::new(cc)))),
+        Box::new(move |cc| Ok(Box::new(App::new(cc, config, config_error)))),
     )
+}
+
+/// Release builds on Windows have no console; this is the macOS equivalent.
+/// Started from a terminal, the widget relaunches itself with no terminal and
+/// returns the prompt. The relaunched copy has no terminal, so it runs the
+/// widget. If the relaunch fails, the widget runs in the foreground instead.
+#[cfg(all(target_os = "macos", not(debug_assertions)))]
+fn detach_from_terminal() -> bool {
+    use std::io::IsTerminal;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    unsafe extern "C" {
+        fn setsid() -> i32;
+    }
+
+    let from_terminal = std::io::stdin().is_terminal()
+        || std::io::stdout().is_terminal()
+        || std::io::stderr().is_terminal();
+    if !from_terminal {
+        return false;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let mut cmd = Command::new(exe);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // A new session, so Ctrl+C or closing the terminal does not reach the widget.
+    unsafe {
+        cmd.pre_exec(|| {
+            if setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    cmd.spawn().is_ok()
 }
 
 /// Whole-window opacity through a layered window. Per-pixel transparency is not
 /// available with the OpenGL renderer on Windows, so this dims the whole card.
-/// `USAGE_WIDGET_OPACITY` (20-100) overrides the default.
 #[cfg(windows)]
-fn set_opacity(hwnd: isize) {
+fn set_opacity(hwnd: isize, percent: u32) {
     #[link(name = "user32")]
     unsafe extern "system" {
         fn GetWindowLongPtrW(hwnd: isize, index: i32) -> isize;
@@ -1523,11 +1918,7 @@ fn set_opacity(hwnd: isize) {
     const WS_EX_LAYERED: isize = 0x0008_0000;
     const LWA_ALPHA: u32 = 0x2;
 
-    let percent = std::env::var("USAGE_WIDGET_OPACITY")
-        .ok()
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .unwrap_or(DEFAULT_OPACITY_PERCENT)
-        .clamp(20, 100);
+    let percent = percent.clamp(20, 100);
     if percent >= 100 {
         return;
     }
@@ -1573,11 +1964,35 @@ fn claim_single_instance(wait: Duration) -> bool {
     }
 }
 
+/// Holds an exclusive lock on a file for the life of the process; returns false
+/// if another instance already holds it.
 #[cfg(not(windows))]
-fn claim_single_instance(_wait: Duration) -> bool {
-    true
+fn claim_single_instance(wait: Duration) -> bool {
+    use std::os::fd::AsRawFd;
+    unsafe extern "C" {
+        fn flock(fd: i32, operation: i32) -> i32;
+    }
+    const LOCK_EX: i32 = 2;
+    const LOCK_NB: i32 = 4;
+
+    let Ok(file) = std::fs::File::create(std::env::temp_dir().join("usage-widget.lock")) else {
+        return true;
+    };
+    let start = std::time::Instant::now();
+    loop {
+        if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0 {
+            // The system releases the lock when the process exits.
+            std::mem::forget(file);
+            return true;
+        }
+        if start.elapsed() >= wait {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
 }
 
+#[cfg(windows)]
 const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 
 /// Registers (or removes) this exe in the per-user Run key so it starts at login.
@@ -1625,9 +2040,58 @@ fn set_run_at_login(enable: bool) -> Result<String, String> {
     })
 }
 
-#[cfg(not(windows))]
+/// Adds (or removes) a launch agent that starts this binary at login.
+#[cfg(target_os = "macos")]
+fn set_run_at_login(enable: bool) -> Result<String, String> {
+    const LABEL: &str = "io.github.pepsi-enjoyer.usage-widget";
+    let home = std::env::var_os("HOME").ok_or("HOME is not set")?;
+    let plist = std::path::Path::new(&home)
+        .join("Library/LaunchAgents")
+        .join(format!("{LABEL}.plist"));
+    if !enable {
+        return match std::fs::remove_file(&plist) {
+            Ok(()) => Ok("usage-widget will no longer start at login.".into()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Ok("usage-widget was not registered to run at login.".into())
+            }
+            Err(e) => Err(format!("could not remove {}: {e}", plist.display())),
+        };
+    }
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe = exe
+        .display()
+        .to_string()
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    let xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{exe}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>
+"#
+    );
+    let write = || {
+        std::fs::create_dir_all(plist.parent().unwrap())?;
+        std::fs::write(&plist, xml)
+    };
+    write().map_err(|e| format!("could not write {}: {e}", plist.display()))?;
+    Ok("usage-widget will start at login.\n\nRun `usage-widget --no-startup` to undo.".into())
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn set_run_at_login(_enable: bool) -> Result<String, String> {
-    Err("--startup is only supported on Windows".into())
+    Err("--startup is only supported on Windows and macOS".into())
 }
 
 /// Reports a flag's outcome. Release builds have no console, so use a message box on Windows.
@@ -1636,6 +2100,7 @@ fn finish(result: Result<String, String>) -> eframe::Result {
         Ok(msg) => (msg.clone(), false),
         Err(msg) => (msg.clone(), true),
     };
+    #[cfg(windows)]
     message_box(&text, is_err);
     if is_err {
         eprintln!("{text}");
@@ -1674,6 +2139,70 @@ fn message_box(text: &str, is_err: bool) {
             );
         }
     }
-    #[cfg(not(windows))]
+    // The widget has no terminal on macOS either, so show a dialog.
+    #[cfg(target_os = "macos")]
+    {
+        let style = if is_err { "critical" } else { "informational" };
+        let _ = std::process::Command::new("osascript")
+            .args([
+                "-e",
+                "on run argv",
+                "-e",
+                &format!("display alert \"usage-widget\" message (item 1 of argv) as {style}"),
+                "-e",
+                "end run",
+                text,
+            ])
+            .status();
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     eprintln!("{text}");
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+
+    #[test]
+    fn precision_widens_the_card_only_when_needed() {
+        let ctx = egui::Context::default();
+        let (mut app, _, _) = App::for_test(vec![Provider::Claude]);
+        let window = |label: &str, used| Meter {
+            label: Some(label.into()),
+            used,
+            total: 100.0,
+            unit: Unit::Percent,
+            resets_at: Some(now_unix() + 3 * 86_400),
+        };
+        app.slots.insert(
+            Provider::Claude,
+            Slot {
+                usage: Some(Usage {
+                    meters: vec![window("5h", 42.123), window("wk", 17.456)],
+                    personal: true,
+                }),
+                updated: Some(now_unix()),
+                ..Default::default()
+            },
+        );
+        let mut width = |precision| {
+            app.precision = precision;
+            let mut width = 0.0;
+            let mut output = ctx.run_ui(egui::RawInput::default(), |_| {
+                width = app.card_width(&ctx, &app.shown());
+            });
+            output.textures_delta.clear();
+            width
+        };
+        let whole = width(0);
+        assert_eq!(whole, WIDTH, "{whole}");
+        assert!(width(3) > WIDTH);
+    }
+
+    #[test]
+    fn disabled_services_are_left_out() {
+        let (app, _, _) = App::for_test(Vec::new());
+        assert!(app.found().is_empty());
+        assert_eq!(app.empty_text(&[]).1, "All disabled");
+    }
 }
