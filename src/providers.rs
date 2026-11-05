@@ -70,28 +70,7 @@ impl Provider {
     pub fn refresh_token(self) -> Result<(), String> {
         match self {
             Provider::Copilot => Err("the gh token does not expire".into()),
-            Provider::Claude => run_headless(
-                "claude",
-                &[
-                    "-p",
-                    "--model",
-                    "haiku",
-                    "--effort",
-                    "low",
-                    "--max-turns",
-                    "1",
-                    "--no-session-persistence",
-                    "--strict-mcp-config",
-                    "--tools",
-                    "",
-                    "--disable-slash-commands",
-                    "--setting-sources",
-                    "",
-                    "--system-prompt",
-                    "Reply with ok.",
-                    "ok",
-                ],
-            ),
+            Provider::Claude => refresh_claude_token(),
             Provider::Codex => {
                 // The user config is skipped so a costly default model or effort
                 // and MCP servers are not used for it.
@@ -124,6 +103,65 @@ impl Provider {
             Provider::Codex => codex(config.codex.estimate),
         }
     }
+}
+
+fn refresh_claude_token() -> Result<(), String> {
+    refresh_claude_token_with(claude_credentials, || {
+        run_headless(
+            "claude",
+            &[
+                "-p",
+                "--model",
+                "haiku",
+                "--effort",
+                "low",
+                "--max-turns",
+                "1",
+                "--no-session-persistence",
+                "--strict-mcp-config",
+                "--tools",
+                "",
+                "--disable-slash-commands",
+                "--setting-sources",
+                "",
+                "--system-prompt",
+                "Reply with ok.",
+                "ok",
+            ],
+        )
+    })
+}
+
+fn refresh_claude_token_with(
+    mut credentials: impl FnMut() -> Result<Value, FetchError>,
+    run: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    let before = credentials().ok();
+    let result = run();
+    // Claude can renew the credentials before the prompt fails at the usage cap.
+    // A new, unexpired token is a successful refresh even when that prompt fails.
+    result.or_else(|error| {
+        if claude_token_refreshed(before.as_ref(), credentials().ok().as_ref(), now_unix()) {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    })
+}
+
+fn claude_token_refreshed(before: Option<&Value>, after: Option<&Value>, now: i64) -> bool {
+    let Some(after) = after.map(|c| &c["claudeAiOauth"]) else {
+        return false;
+    };
+    let Ok(token) = claude_access_token(after, now) else {
+        return false;
+    };
+    let before = before.map(|c| &c["claudeAiOauth"]);
+    !token.is_empty()
+        && i64_of(&after["expiresAt"]).is_some_and(|ms| ms / 1000 > now)
+        && before.is_none_or(|b| {
+            b["accessToken"].as_str() != Some(token) || b["expiresAt"] != after["expiresAt"]
+        })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
@@ -854,16 +892,28 @@ fn claude_should_call(api: bool, now: i64, newest: Option<i64>, state: &ClaudeSt
 }
 
 fn claude(config: &crate::config::Claude) -> Result<Usage, FetchError> {
+    claude_usage(
+        config,
+        claude_credentials(),
+        claude_code_state(),
+        &mut ClaudeState::load(),
+    )
+}
+
+fn claude_usage(
+    config: &crate::config::Claude,
+    creds: Result<Value, FetchError>,
+    code: ClaudeCodeState,
+    state: &mut ClaudeState,
+) -> Result<Usage, FetchError> {
     let api = config.api;
-    let creds = claude_credentials();
     let ClaudeCodeState {
         cache,
         account,
         version,
         org,
         plan: profile_plan,
-    } = claude_code_state();
-    let mut state = ClaudeState::load();
+    } = code;
     let now = now_unix();
     let plan = profile_plan.or_else(|| claude_oauth(&creds).ok().and_then(claude_plan));
     if plan.as_deref() == Some("Free") {
@@ -872,7 +922,16 @@ fn claude(config: &crate::config::Claude) -> Result<Usage, FetchError> {
             "Claude Free has no plan usage to track",
         ));
     }
-    if note_account(&mut state, account.as_deref(), now) {
+    // Check expiry even when fresh cached usage or API backoff skips the call.
+    // Keep the typed error so the widget shows its short red label.
+    if api
+        && let Ok(oauth) = claude_oauth(&creds)
+        && let Err(error) = claude_access_token(oauth, now)
+        && error.problem == Problem::TokenExpired
+    {
+        return Err(error);
+    }
+    if note_account(state, account.as_deref(), now) {
         state.save();
     }
     // Our saved response is only good for the account it was fetched for.
@@ -893,7 +952,7 @@ fn claude(config: &crate::config::Claude) -> Result<Usage, FetchError> {
     // there is no reading (for example an expired token).
     static LAST_PROBLEM: std::sync::Mutex<Option<FetchError>> = std::sync::Mutex::new(None);
     let mut problem = None;
-    if claude_should_call(api, now, newest, &state) {
+    if claude_should_call(api, now, newest, state) {
         state.last_attempt = now;
         let result = claude_api(claude_oauth(&creds), version.as_deref());
         match result {
@@ -920,6 +979,14 @@ fn claude(config: &crate::config::Claude) -> Result<Usage, FetchError> {
             .unwrap_or_else(|e| e.into_inner())
             .clone()
     });
+    if let Some(error) = &problem
+        && matches!(
+            error.problem,
+            Problem::TokenExpired | Problem::TokenRejected
+        )
+    {
+        return Err(error.clone());
+    }
 
     let rate_limited = now < state.blocked_until;
     let snap = [cache.as_ref(), state.last.as_ref()]
@@ -1007,14 +1074,8 @@ fn claude(config: &crate::config::Claude) -> Result<Usage, FetchError> {
         state.blocked_until,
         problem.map(|e| e.detail),
     );
-    let (cycle, renewal_problem) = claude_renewal(
-        config,
-        &mut state,
-        now,
-        &meters,
-        org.as_deref(),
-        plan.as_deref(),
-    );
+    let (cycle, renewal_problem) =
+        claude_renewal(config, state, now, &meters, org.as_deref(), plan.as_deref());
     // Say why the renewal date is missing, but only when there is none to show.
     let note = match renewal_problem.filter(|_| cycle.is_none()) {
         Some(e) => Some(note.map_or(format!("renewal: {e}"), |n| format!("{n} · renewal: {e}"))),
@@ -1235,25 +1296,27 @@ fn claude_user_agent(version: Option<&str>) -> String {
     format!("claude-code/{version}")
 }
 
-fn claude_api(
-    oauth: Result<&Value, &FetchError>,
-    version: Option<&str>,
-) -> Result<Value, ClaudeError> {
-    let oauth = oauth.map_err(|e| e.clone())?;
+fn claude_access_token(oauth: &Value, now: i64) -> Result<&str, FetchError> {
     let token = oauth["accessToken"].as_str().ok_or_else(|| {
         FetchError::new(
             Problem::NotAvailable,
             "no claudeAiOauth.accessToken; log in with `claude`",
         )
     })?;
-    if i64_of(&oauth["expiresAt"]).is_some_and(|ms| ms / 1000 < now_unix()) {
+    if i64_of(&oauth["expiresAt"]).is_some_and(|ms| ms / 1000 <= now) {
         return Err(FetchError::new(
             Problem::TokenExpired,
             "Claude token expired; right-click > Refresh token, or run `claude`",
-        )
-        .into());
+        ));
     }
+    Ok(token)
+}
 
+fn claude_api(
+    oauth: Result<&Value, &FetchError>,
+    version: Option<&str>,
+) -> Result<Value, ClaudeError> {
+    let token = claude_access_token(oauth.map_err(|e| e.clone())?, now_unix())?;
     let auth = format!("Bearer {token}");
     let user_agent = claude_user_agent(version);
     let (status, json, retry_after) = get_json_retry(
@@ -1640,6 +1703,84 @@ fn title_case(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn claude_creds(token: &str, expires: i64) -> Value {
+        serde_json::json!({
+            "claudeAiOauth": { "accessToken": token, "expiresAt": expires * 1000 }
+        })
+    }
+
+    #[test]
+    fn claude_refresh_succeeds_when_credentials_renew_before_prompt_fails() {
+        let now = now_unix();
+        let mut credentials = [
+            claude_creds("expired", now - 60),
+            claude_creds("renewed", now + 3600),
+        ]
+        .into_iter();
+        let result = refresh_claude_token_with(
+            || Ok(credentials.next().unwrap()),
+            || Err("claude failed (exit code: 1)".into()),
+        );
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn claude_refresh_keeps_real_failures() {
+        let now = now_unix();
+        let before = claude_creds("original", now + 3600);
+        for after in [
+            Ok(before.clone()),
+            Ok(claude_creds("still-expired", now - 60)),
+            Ok(claude_creds("", now + 3600)),
+            Ok(serde_json::json!({ "claudeAiOauth": { "accessToken": "no-expiry" } })),
+            Ok(Value::Null),
+            Err(FetchError::new(Problem::Other, "unreadable credentials")),
+        ] {
+            let mut credentials = [Ok(before.clone()), after].into_iter();
+            let result = refresh_claude_token_with(
+                || credentials.next().unwrap(),
+                || Err("claude failed".into()),
+            );
+            assert_eq!(result, Err("claude failed".into()));
+        }
+    }
+
+    #[test]
+    fn claude_expired_token_is_an_error_even_with_cached_usage_and_backoff() {
+        let now = now_unix();
+        for cache_age in [60, 1800] {
+            for blocked_until in [0, now + 900] {
+                let snapshot = Snapshot {
+                    at: now - cache_age,
+                    usage: serde_json::json!({ "five_hour": { "utilization": 100 } }),
+                    account: None,
+                };
+                let code = ClaudeCodeState {
+                    cache: Some(snapshot.clone()),
+                    plan: Some("Pro".into()),
+                    ..Default::default()
+                };
+                let mut state = ClaudeState {
+                    last: Some(snapshot),
+                    blocked_until,
+                    ..Default::default()
+                };
+                let error = claude_usage(
+                    &crate::config::Claude::default(),
+                    Ok(claude_creds("expired", now - 60)),
+                    code,
+                    &mut state,
+                )
+                .err()
+                .expect("cached usage must not hide an expired token");
+                assert_eq!(error.problem, Problem::TokenExpired);
+                assert_eq!(error.problem.label(), "Token expired");
+                assert!(error.detail.contains("Refresh token"));
+                assert_eq!(state.last_attempt, 0);
+            }
+        }
+    }
 
     #[test]
     fn account_switch_resets_backoff_and_distrusts_older_statusline() {
