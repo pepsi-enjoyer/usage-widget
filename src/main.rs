@@ -2542,14 +2542,16 @@ fn set_run_at_login(_enable: bool) -> Result<String, String> {
     Err("--startup is only supported on Windows and macOS".into())
 }
 
-/// Reports a flag's outcome. Release builds have no console, so use a message box on Windows.
+/// Reports a flag's outcome, with a Windows dialog only for errors.
 fn finish(result: Result<String, String>) -> eframe::Result {
     let (text, is_err) = match &result {
         Ok(msg) => (msg.clone(), false),
         Err(msg) => (msg.clone(), true),
     };
     #[cfg(windows)]
-    message_box(&text, is_err);
+    if is_err {
+        message_box(&text, true);
+    }
     if is_err {
         eprintln!("{text}");
         std::process::exit(1);
