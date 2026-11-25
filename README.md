@@ -1,7 +1,7 @@
 # usage-widget
 
 A small always-on-top Windows and macOS widget that shows how much of your GitHub Copilot,
-Claude and Codex allowance you have used.
+Claude, Codex and Google Antigravity allowance you have used.
 
 | Business plans | Personal subscriptions |
 | --- | --- |
@@ -33,11 +33,14 @@ There is nothing to log in to. The widget uses the logins your CLIs already have
 - **Copilot:** the GitHub CLI (`gh auth login`)
 - **Claude:** Claude Code (`claude`)
 - **Codex:** the Codex CLI (`codex`)
+- **Antigravity:** the Google Antigravity CLI (`agy`). Sign in once; the widget reads
+  that sign-in and never runs `agy` itself. Antigravity stays hidden by default until
+  a valid sign-in is found (or you enable it under **Show**).
 
 Services appear when the widget finds a supported plan or quota. If a token expires, the widget
-says so; run that CLI once and it picks the new token up. Right-click > Refresh
-token does that for Claude or Codex: it runs a one-line prompt on the cheapest
-model, which uses a little of your allowance, then refreshes.
+says so; run that CLI once and it picks the new token up. Right-click > **Refresh** > **Claude**
+or **Codex** does that for you: it runs a one-line prompt on the cheapest model, which uses a
+little of your allowance, then refreshes.
 
 ## What it shows
 
@@ -46,6 +49,10 @@ model, which uses a little of your allowance, then refreshes.
 - **Personal plans** (Claude Pro/Max, ChatGPT Plus/Pro): your 5-hour and weekly usage.
   The one you will run out of first is highlighted, the bar shows it, and the timer
   counts down to when it resets. Copilot Pro shows its monthly allowance.
+- **Antigravity** shows the 5-hour and weekly windows of its busiest model group,
+  highlighted the same way. Hover Antigravity to see usage and reset
+  times for each model group, or run `usage-widget usage` for the same readings as
+  JSON.
 
 Bars go green, yellow and red as you use more. Hover a service name for its plan,
 renewal date, exact reset times and additional caps. Click Copilot, Claude, or Codex to open its usage page.
@@ -57,10 +64,9 @@ more room.
 ## Using it
 
 - Drag it anywhere. It remembers where it was.
-- Right-click to refresh, refresh a service's token, minimize, resize, check for
-  updates, open available usage pages, or quit.
-- Untick a service under Show in the right-click menu to hide it. Tick it again to
-  bring it back.
+- Right-click to refresh all or a visible service under **Refresh**, minimize, show
+  or hide services under **Show**, open usage pages under **View usage**, resize,
+  check for updates, edit config, or quit.
 - On macOS, the menu bar menu also hides and shows the widget.
 - Hover a red error to see the full message.
 - Hover a personal plan's countdown, or a window's percentage or label, to see when
@@ -87,5 +93,6 @@ Environment variables override the matching config settings:
 ## Notes
 
 The usage numbers come from the same endpoints the CLIs and web settings pages use.
-They are not officially documented and may change. Logos are from
-[Simple Icons](https://simpleicons.org) (CC0); the marks belong to their owners.
+Antigravity quota comes from the endpoints behind `agy /usage`. The Antigravity
+mark is from [Google](https://antigravity.google/). Other logos are from
+[Simple Icons](https://simpleicons.org) (CC0). The marks belong to their owners.

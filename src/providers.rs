@@ -12,6 +12,8 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+mod antigravity;
+
 const UA: &str = "usage-widget/1.0 (+https://github.com/pepsi-enjoyer/usage-widget)";
 
 /// Copilot premium-request credits: 50,000 credits = $500.
@@ -28,21 +30,19 @@ pub enum Provider {
     Copilot,
     Claude,
     Codex,
+    Antigravity,
 }
 
 impl Provider {
-    pub const ALL: [Provider; 3] = [Self::Copilot, Self::Claude, Self::Codex];
+    pub const ALL: [Provider; 4] = [Self::Copilot, Self::Claude, Self::Codex, Self::Antigravity];
 
     pub fn name(self) -> &'static str {
         match self {
             Provider::Copilot => "Copilot",
             Provider::Claude => "Claude",
             Provider::Codex => "Codex",
+            Provider::Antigravity => "Antigravity",
         }
-    }
-
-    pub fn header_name(self) -> &'static str {
-        self.name()
     }
 
     /// Three-letter tag for the minimized view.
@@ -51,6 +51,7 @@ impl Provider {
             Provider::Copilot => "COP",
             Provider::Claude => "CLD",
             Provider::Codex => "CDX",
+            Provider::Antigravity => "AGY",
         }
     }
 
@@ -59,6 +60,7 @@ impl Provider {
             Provider::Copilot => Some("https://github.com/settings/copilot/features"),
             Provider::Claude => Some("https://claude.ai/settings/usage"),
             Provider::Codex => Some("https://chatgpt.com/settings/usage?tab=overview"),
+            Provider::Antigravity => None,
         }
     }
 
@@ -74,6 +76,7 @@ impl Provider {
     pub fn refresh_token(self) -> Result<(), String> {
         match self {
             Provider::Copilot => Err("the gh token does not expire".into()),
+            Provider::Antigravity => Err("sign in with the Antigravity CLI (agy)".into()),
             Provider::Claude => refresh_claude_token(),
             Provider::Codex => {
                 // The user config is skipped so a costly default model or effort
@@ -105,6 +108,7 @@ impl Provider {
             Provider::Copilot => copilot(),
             Provider::Claude => claude(&config.claude),
             Provider::Codex => codex(config.codex.estimate),
+            Provider::Antigravity => antigravity::fetch(),
         }
     }
 }
@@ -1333,7 +1337,7 @@ fn claude_access_token(oauth: &Value, now: i64) -> Result<&str, FetchError> {
     if i64_of(&oauth["expiresAt"]).is_some_and(|ms| ms / 1000 <= now) {
         return Err(FetchError::new(
             Problem::TokenExpired,
-            "Claude token expired; right-click > Refresh token, or run `claude`",
+            "Claude token expired; right-click > Refresh > Claude, or run `claude`",
         ));
     }
     Ok(token)
@@ -1358,7 +1362,7 @@ fn claude_api(
         200 => Ok(json),
         401 | 403 => Err(FetchError::new(
             Problem::TokenRejected,
-            "Claude token rejected; right-click > Refresh token, or run `claude`",
+            "Claude token rejected; right-click > Refresh > Claude, or run `claude`",
         )
         .into()),
         429 => Err(ClaudeError::RateLimited(retry_after.unwrap_or(0))),
@@ -1504,7 +1508,7 @@ fn codex_once(estimate: bool) -> Result<Usage, FetchError> {
     {
         return Err(FetchError::new(
             Problem::TokenExpired,
-            "Codex token expired; right-click > Refresh token, or run `codex`",
+            "Codex token expired; right-click > Refresh > Codex, or run `codex`",
         ));
     }
     let account_id = tokens["account_id"].as_str().unwrap_or("");
@@ -1521,7 +1525,7 @@ fn codex_once(estimate: bool) -> Result<Usage, FetchError> {
         401 | 403 => {
             return Err(FetchError::new(
                 Problem::TokenRejected,
-                "Codex token rejected; right-click > Refresh token, or run `codex`",
+                "Codex token rejected; right-click > Refresh > Codex, or run `codex`",
             ));
         }
         s => {
@@ -1808,7 +1812,7 @@ mod tests {
                 .expect("cached usage must not hide an expired token");
                 assert_eq!(error.problem, Problem::TokenExpired);
                 assert_eq!(error.problem.label(), "Token expired");
-                assert!(error.detail.contains("Refresh token"));
+                assert!(error.detail.contains("Refresh > Claude"));
                 assert_eq!(state.last_attempt, 0);
             }
         }
